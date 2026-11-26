@@ -77,3 +77,57 @@ export async function coachOnRecentActivities(
   const insights = await mistral.chat(messages);
   return { insights, stats: buildWeeklySummary(activities) };
 }
+
+/**
+ * Pull the last 14 days of activities, split them into this week vs last week,
+ * and ask Mistral for a coaching report with week-over-week comparison.
+ */
+export async function weeklyCoachingReport(
+  strava: StravaClient,
+  mistral: MistralClient,
+  options: { now?: Date } = {},
+): Promise<{
+  report: string;
+  thisWeek: ReturnType<typeof buildWeeklySummary>;
+  lastWeek: ReturnType<typeof buildWeeklySummary>;
+  deltaKm: number;
+}> {
+  const now = options.now ?? new Date();
+  const endOfThisWeek = Math.floor(now.getTime() / 1000);
+  const startOfThisWeek = endOfThisWeek - 7 * 86400;
+  const startOfLastWeek = startOfThisWeek - 7 * 86400;
+
+  const recent = await strava.getAllActivities(startOfLastWeek);
+  const thisWeekActs = recent.filter((a) => Date.parse(a.start_date) / 1000 >= startOfThisWeek);
+  const lastWeekActs = recent.filter((a) => Date.parse(a.start_date) / 1000 < startOfThisWeek);
+
+  const thisWeek = buildWeeklySummary(thisWeekActs);
+  const lastWeek = buildWeeklySummary(lastWeekActs);
+  const deltaKm = Math.round((thisWeek.totalKm - lastWeek.totalKm) * 10) / 10;
+
+  const lines = thisWeekActs.map(
+    (a) =>
+      `- ${a.start_date.slice(0, 10)} | ${a.sport_type ?? a.type} | "${a.name}" | ` +
+      `${formatKm(a.distance)} km | ${formatDuration(a.moving_time)}` +
+      (a.average_heartrate ? ` | avg HR ${Math.round(a.average_heartrate)}` : ''),
+  );
+  const lastLines = lastWeekActs.map(
+    (a) => `- ${a.start_date.slice(0, 10)} | ${a.sport_type ?? a.type} | ${formatKm(a.distance)} km | ${formatDuration(a.moving_time)}`,
+  );
+
+  const prompt =
+    `This week's Strava activities:\n${lines.join('\n') || '(none)'}\n\n` +
+    `Last week's activities:\n${lastLines.join('\n') || '(none)'}\n\n` +
+    `Week-over-week: this week ${thisWeek.count} activities, ${thisWeek.totalKm} km, ${thisWeek.totalTime}, ` +
+    `${thisWeek.elevation} m elevation; last week ${lastWeek.count} activities, ${lastWeek.totalKm} km, ` +
+    `${lastWeek.totalTime}, ${lastWeek.elevation} m elevation (delta: ${deltaKm >= 0 ? '+' : ''}${deltaKm} km).\n\n` +
+    'As my endurance coach, write a weekly report: 1) week-over-week load change and whether it is a healthy progression ' +
+    '(watch the 10% rule), 2) what went well, 3) what to adjust, 4) a concrete plan for next week with suggested days, ' +
+    'sessions and target volumes. Keep it under 300 words.';
+
+  const report = await mistral.chat([
+    { role: 'system', content: 'You are a concise, data-driven endurance coach.' },
+    { role: 'user', content: prompt },
+  ]);
+  return { report, thisWeek, lastWeek, deltaKm };
+}
