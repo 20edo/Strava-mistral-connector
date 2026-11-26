@@ -1,0 +1,21 @@
+{
+  "name": "strava-mistral-connector",
+  "version": "0.1.0",
+  "description": "Pull Strava activities and generate AI coaching insights with the Mistral API",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "bin": { "strava-mistral": "dist/cli.js" },
+  "keywords": ["strava", "mistral", "ai", "fitness", "connector"],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "@types/node": "^22.0.0"
+  }
+}
