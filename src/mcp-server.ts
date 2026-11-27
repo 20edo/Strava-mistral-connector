@@ -342,6 +342,12 @@ export function startServer(port = Number(process.env.PORT ?? 8080)): http.Serve
   const ctx = createContextFromEnv();
   const token = process.env.MCP_TOKEN;
   const server = http.createServer((req, res) => {
+    // Health check endpoint for hosting platforms (Render, etc.)
+    if (req.method === 'GET' && (req.url === '/healthz' || req.url === '/')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', tools: TOOLS.length }));
+      return;
+    }
     if (req.method !== 'POST') {
       res.writeHead(405).end('MCP server: POST JSON-RPC to /mcp');
       return;
