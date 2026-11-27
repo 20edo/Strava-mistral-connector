@@ -1,20 +1,23 @@
 /**
  * Minimal MCP (Model Context Protocol) server over Streamable HTTP.
  *
- * Exposes Strava + Mistral coaching tools so the connector can be added to
- * Mistral Vibe (Settings -> Connectors -> + Add Connector -> Custom MCP
- * Connector) or any other MCP client.
+ * Exposes Strava + Garmin + Mistral coaching tools so the connector can be
+ * added to Mistral Vibe (Settings -> Connectors -> + Add Connector ->
+ * Custom MCP Connector) or any other MCP client.
  *
  * Env:
  *   MCP_TOKEN            bearer token clients must send (omit to allow all)
  *   STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET / STRAVA_ACCESS_TOKEN /
- *   STRAVA_REFRESH_TOKEN / STRAVA_EXPIRES_AT   Strava credentials
+ *   STRAVA_REFRESH_TOKEN / STRAVA_EXPIRES_AT            Strava credentials
  *   MISTRAL_API_KEY      Mistral API key
+ *   GARMIN_CONSUMER_KEY / GARMIN_CONSUMER_SECRET /
+ *   GARMIN_USER_ACCESS_TOKEN / GARMIN_USER_ACCESS_TOKEN_SECRET   optional Garmin (Health API)
  *   PORT                 listen port (default 8080)
  */
 import http from 'node:http';
 import { StravaClient, type StravaActivity } from './strava';
 import { MistralClient } from './mistral';
+import { GarminClient } from './garmin';
 import { buildWeeklySummary, formatKm, formatDuration, pace } from './connector';
 
 // ---------- JSON-RPC / MCP plumbing ----------
@@ -31,6 +34,7 @@ type JsonValue = string | number | boolean | null | JsonValue[] | { [k: string]:
 export interface McpContext {
   strava: StravaClient;
   mistral: MistralClient;
+  garmin?: GarminClient;
 }
 
 export type ToolHandler = (args: Record<string, unknown>, ctx: McpContext) => Promise<JsonValue>;
@@ -153,7 +157,105 @@ export const TOOLS: ToolDef[] = [
       return { thisWeek: tw, lastWeek: lw, deltaKm, report };
     },
   },
+  {
+    name: 'garmin_hrv',
+    description: 'Heart-rate-variability summary from Garmin for a calendar date (YYYY-MM-DD). Requires the Garmin Health API.',
+    inputSchema: {
+      type: 'object',
+      properties: { date: { type: 'string', description: 'Calendar date YYYY-MM-DD' } },
+      required: ['date'],
+    },
+    handler: async (args, ctx) => {
+      if (!ctx.garmin) throw new Error('Garmin is not configured: set GARMIN_* env vars');
+      return ctx.garmin.getHrv(dayStartEpoch(String(args.date)));
+    },
+  },
+  {
+    name: 'garmin_sleep',
+    description: 'Sleep sessions (stages, score) from Garmin for a calendar date (YYYY-MM-DD). Requires the Garmin Health API.',
+    inputSchema: {
+      type: 'object',
+      properties: { date: { type: 'string', description: 'Calendar date YYYY-MM-DD' } },
+      required: ['date'],
+    },
+    handler: async (args, ctx) => {
+      if (!ctx.garmin) throw new Error('Garmin is not configured: set GARMIN_* env vars');
+      const ts = dayStartEpoch(String(args.date));
+      return ctx.garmin.getSleeps(ts, ts + 86400);
+    },
+  },
+  {
+    name: 'garmin_daily_stress',
+    description: 'Daily stress and body battery from Garmin for a calendar date (YYYY-MM-DD). Requires the Garmin Health API.',
+    inputSchema: {
+      type: 'object',
+      properties: { date: { type: 'string', description: 'Calendar date YYYY-MM-DD' } },
+      required: ['date'],
+    },
+    handler: async (args, ctx) => {
+      if (!ctx.garmin) throw new Error('Garmin is not configured: set GARMIN_* env vars');
+      return ctx.garmin.getDailyStress(dayStartEpoch(String(args.date)));
+    },
+  },
+  {
+    name: 'garmin_readiness_briefing',
+    description:
+      'AI readiness briefing with Mistral: combines Garmin HRV, sleep and stress for the last N days with recent Strava load into training-readiness advice.',
+    inputSchema: {
+      type: 'object',
+      properties: { days: { type: 'number', description: 'How many days of wellness data (default 7)' } },
+    },
+    handler: async (args, ctx) => {
+      if (!ctx.garmin) throw new Error('Garmin is not configured: set GARMIN_* env vars');
+      const days = Math.min(Number(args.days ?? 7) || 7, 28);
+      const now = Math.floor(Date.now() / 1000);
+      const wellnessLines: string[] = [];
+      for (let i = 0; i < days; i++) {
+        const dayTs = startOfUtcDay(now) - i * 86400;
+        const date = new Date(dayTs * 1000).toISOString().slice(0, 10);
+        const [hrv, sleep, stress] = await Promise.all([
+          ctx.garmin.getHrv(dayTs),
+          ctx.garmin.getSleeps(dayTs, dayTs + 86400),
+          ctx.garmin.getDailyStress(dayTs),
+        ]);
+        const h = hrv[0];
+        const s = sleep[0];
+        const st = stress[0];
+        wellnessLines.push(
+          `${date}: HRV ${h?.hrvValue ?? 'n/a'} (${h?.hrvStatus ?? 'n/a'})` +
+            ` | sleep ${s?.sleepTimeSeconds ? formatDuration(s.sleepTimeSeconds) : 'n/a'}` +
+            ` (deep ${s?.deepSleepSeconds ? formatDuration(s.deepSleepSeconds) : 'n/a'}, REM ${s?.remSleepSeconds ? formatDuration(s.remSleepSeconds) : 'n/a'}` +
+            `${s?.overallSleepScore?.value != null ? `, score ${s.overallSleepScore.value}` : ''})` +
+            ` | stress ${st?.overallStressLevel ?? 'n/a'}` +
+            ` | body battery ${st?.bodyBatteryMostRecentValue ?? 'n/a'}`,
+        );
+      }
+      const acts = await ctx.strava.getActivities({ perPage: 15 });
+      const loadLines = acts
+        .filter((a) => Date.parse(a.start_date) / 1000 >= now - days * 86400)
+        .map((a) => `- ${a.start_date.slice(0, 10)} | ${a.sport_type ?? a.type} | ${formatKm(a.distance)} km | ${formatDuration(a.moving_time)}`)
+        .join('\n') || '(none)';
+      const prompt =
+        `Wellness data for the last ${days} days:\n${wellnessLines.join('\n')}\n\n` +
+        `Recent training load:\n${loadLines}\n\n` +
+        'As my endurance coach, give a training-readiness briefing: 1) today\'s readiness (low/medium/high) with the main signals, ' +
+        '2) recovery trends to watch, 3) what to train today (or rest), with intensity guidance. Under 200 words.';
+      const briefing = await ctx.mistral.chat([
+        { role: 'system', content: 'You are a concise, data-driven endurance coach.' },
+        { role: 'user', content: prompt },
+      ]);
+      return { briefing, wellness: wellnessLines };
+    },
+  },
 ];
+
+function dayStartEpoch(calendarDate: string): number {
+  return Math.floor(Date.parse(`${calendarDate}T00:00:00Z`) / 1000);
+}
+
+function startOfUtcDay(epochSeconds: number): number {
+  return Math.floor(epochSeconds / 86400) * 86400;
+}
 
 export function rpcResult(id: RpcRequest['id'], result: JsonValue) {
   return { jsonrpc: '2.0', id, result };
@@ -174,7 +276,7 @@ export async function handleRpc(req: RpcRequest, ctx: McpContext): Promise<Recor
       return rpcResult(req.id, {
         protocolVersion: String(req.params?.protocolVersion ?? '2025-06-18'),
         capabilities: { tools: {} },
-        serverInfo: { name: 'strava-mistral-connector', version: '0.1.0' },
+        serverInfo: { name: 'strava-mistral-connector', version: '0.3.0' },
       });
     case 'notifications/initialized':
     case 'notifications/cancelled':
@@ -223,7 +325,17 @@ export function createContextFromEnv(): McpContext {
     },
   });
   const mistral = new MistralClient({ apiKey: process.env.MISTRAL_API_KEY! });
-  return { strava, mistral };
+  const garmin =
+    process.env.GARMIN_CONSUMER_KEY && process.env.GARMIN_CONSUMER_SECRET &&
+    process.env.GARMIN_USER_ACCESS_TOKEN && process.env.GARMIN_USER_ACCESS_TOKEN_SECRET
+      ? new GarminClient({
+          consumerKey: process.env.GARMIN_CONSUMER_KEY,
+          consumerSecret: process.env.GARMIN_CONSUMER_SECRET,
+          userAccessToken: process.env.GARMIN_USER_ACCESS_TOKEN,
+          userAccessTokenSecret: process.env.GARMIN_USER_ACCESS_TOKEN_SECRET,
+        })
+      : undefined;
+  return { strava, mistral, garmin };
 }
 
 export function startServer(port = Number(process.env.PORT ?? 8080)): http.Server {
@@ -266,7 +378,7 @@ export function startServer(port = Number(process.env.PORT ?? 8080)): http.Serve
       })();
     });
   });
-  server.listen(port, () => console.error(`Strava-Mistral MCP server listening on :${port}`));
+  server.listen(port, () => console.error(`Strava-Garmin-Mistral MCP server listening on :${port}`));
   return server;
 }
 
